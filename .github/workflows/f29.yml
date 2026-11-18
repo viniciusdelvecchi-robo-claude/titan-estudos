@@ -1,0 +1,85 @@
+name: f29
+
+# F2-9: calibração do ato inteiro (Núcleo + Garimpo V3 a 2%, normal e pessimista, Holm) em 6 famílias sem vantagem.
+# Um mundo por tarefa; 1ª rodada = 119 mundos por família (714 tarefas). Um disparo cobre [inicio, fim), no máximo 256.
+# Extensões (família com aprovação) saem do agregador (--agregar) e vão por "somente".
+# Entradas do disparo só entram por variável de ambiente e são validadas; nunca interpoladas no shell (T12).
+
+on:
+  workflow_dispatch:
+    inputs:
+      inicio:
+        description: "primeira tarefa (inclusive)"
+        default: "0"
+      fim:
+        description: "última tarefa (exclusive); no máximo inicio+256"
+        default: "256"
+      somente:
+        description: "opcional: lista de tarefas separadas por vírgula (ignora inicio/fim)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  plano:
+    runs-on: ubuntu-latest
+    outputs:
+      tarefas: ${{ steps.p.outputs.tarefas }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # série 3.12; a versão exata sai em cada resultado (plataforma)
+      - run: pip install -r requirements.txt
+      - id: p
+        env:
+          ENT_INICIO: ${{ inputs.inicio }}
+          ENT_FIM: ${{ inputs.fim }}
+          ENT_SOMENTE: ${{ inputs.somente }}
+        run: |
+          total=$(python ferramentas/calibracao_f29.py --listar)
+          python - "$total" >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, os, re, sys
+          total = int(sys.argv[1])
+          ini, fim, so = (os.environ[k].strip() for k in ("ENT_INICIO", "ENT_FIM", "ENT_SOMENTE"))
+          if not re.fullmatch(r"\d+", ini) or not re.fullmatch(r"\d+", fim) or not re.fullmatch(r"[\d,\s]*", so):
+              raise SystemExit("entrada invalida")
+          if so:
+              ts = sorted({int(x) for x in so.split(",") if x.strip()})
+          else:
+              ts = list(range(int(ini), min(int(fim), total)))
+          ts = [t for t in ts if 0 <= t < total][:256]
+          print("tarefas=" + json.dumps(ts))
+          EOF
+
+  mundo:
+    needs: plano
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        tarefa: ${{ fromJSON(needs.plano.outputs.tarefas) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: rodar um mundo
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          TAREFA: ${{ matrix.tarefa }}
+        run: |
+          [[ "$TAREFA" =~ ^[0-9]+$ ]] || { echo "entrada invalida"; exit 1; }
+          python ferramentas/calibracao_f29.py --tarefa "$TAREFA" --proc-interno 4 "f29_$TAREFA.jsonl"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: f2_9-tarefa-${{ matrix.tarefa }}
+          path: f29_${{ matrix.tarefa }}.jsonl
+          if-no-files-found: ignore
+          retention-days: 30

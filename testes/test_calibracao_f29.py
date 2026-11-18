@@ -67,8 +67,8 @@ def test_conta_e_projecao_congeladas():
     p = c.projecao_custo()
     assert p["mundos_minimos_k_zero"] == 6 * 119
     assert p["mundos_maximos"] == 6 * 600
-    assert p["horas_minimas"] == 416.5
-    assert p["horas_no_teto"] == 2100.0
+    assert p["estimativa_linear_81_ativos_minutos"] == 25.88
+    assert p["expectativa_github_2x_minutos"] == 12.94
 
 
 def test_k_zero_para_em_119_e_faixas_de_sementes_sao_disjuntas():
@@ -139,7 +139,7 @@ def test_catalogo_sintetico_e_mundo_real_entram_por_injecao():
 
 
 def test_executar_ato_liga_dois_candidatos_e_sentinela(monkeypatch):
-    from titan import aprendizagem, cadeia_garimpo, prova
+    from titan import cadeia_garimpo, prova
 
     t = datetime(2024, 1, 2, 10, tzinfo=UTC)
     it_n = Intencao(Campanha.DAY_TRADE_M15, "N", "Usa500", Lado.COMPRA,
@@ -150,14 +150,11 @@ def test_executar_ato_liga_dois_candidatos_e_sentinela(monkeypatch):
     mundo = SimpleNamespace(
         dias=[date(2023, 1, 2), date(2024, 1, 2)], semente=900_123,
     )
-    monkeypatch.setattr(cadeia_garimpo, "intencoes", lambda w: {"Usa500": [it_g]})
-    monkeypatch.setattr(cadeia_garimpo, "series_isoladas", lambda *a: {("G", "Usa500"): [0., 0.]})
     monkeypatch.setattr(cadeia_garimpo, "janelas_padrao", lambda d: SimpleNamespace(
         janela_inicio=d[0], cofre_inicio=d[1]))
-    monkeypatch.setattr(aprendizagem, "agenda", lambda *a, **k: [object()])
-    monkeypatch.setattr(aprendizagem, "aplicar", lambda *a: [it_g])
-    monkeypatch.setattr(c, "_intencoes_nucleo", lambda w: [it_n])
-    monkeypatch.setattr(c, "_rodar", lambda *a: vazio)
+    monkeypatch.setattr(c, "_preparar_garimpo", lambda *a: [it_g])
+    monkeypatch.setattr(c, "_intencoes_nucleo", lambda *a: [it_n])
+    monkeypatch.setattr(c, "_rodar_par", lambda *a: (vazio, vazio))
     monkeypatch.setattr(c, "_diagnostico", lambda *a: c.DiagnosticoExecucao(1, 0, 0, {}, {}))
 
     def testar(entradas, params):
@@ -179,3 +176,90 @@ def test_executar_ato_liga_dois_candidatos_e_sentinela(monkeypatch):
 def test_configuracao_vencedora_validada(variante, risco):
     with pytest.raises(ValueError):
         c.ConfiguracaoGarimpo(variante, risco)
+
+
+def test_garimpo_compacto_igual_ao_objeto_campo_a_campo():
+    from titan import aprendizagem, cadeia_garimpo as cg
+    from titan.sintetico import Vantagem, gerar_mundo as gerar_sintetico
+
+    mundo = gerar_sintetico(881, 300, 1, Vantagem())
+    mundo.semente = 881
+    params = _portao()
+    cfg = c.ConfiguracaoGarimpo("V3", 0.02)
+    compacto = c._preparar_garimpo(mundo, cfg, params, 1)
+    brutas = cg.intencoes(mundo)
+    series = cg.series_isoladas(mundo, brutas, 0.02)
+    periodos = aprendizagem.agenda(
+        "V3", mundo.dias, series,
+        reamostragens=params.reamostragens, semente=mundo.semente,
+    )
+    objetos = aprendizagem.aplicar([i for s in sorted(brutas) for i in brutas[s]], periodos)
+    assert [i.materializar() for i in compacto] == objetos
+
+
+def _linha_tarefa(tarefa, aprovado=False):
+    familia, n, semente = c._coordenadas_tarefa(tarefa)
+    return {
+        "tarefa": tarefa, "familia": familia.value, "n": n, "semente": semente,
+        "n_ativos": 81, "configuracao": {"variante": "V3", "risco_por_operacao": 0.02},
+        "aprovou_ato": aprovado, "veredito": {}, "execucao": {}, "segundos": 1.0,
+    }
+
+
+def _gravar_linhas(path, linhas):
+    import json
+    path.write_text("".join(json.dumps(x) + "\n" for x in linhas), encoding="utf-8")
+
+
+def test_agregado_falso_igual_ao_sequencial_k_zero(tmp_path):
+    linhas = [_linha_tarefa(i) for i in range(c.N_TAREFAS_INICIAIS)]
+    _gravar_linhas(tmp_path / "tarefas.jsonl", linhas)
+    doc = c.agregar_tarefas(tmp_path, tmp_path / "agregado.json")
+    sequencial = c.calibrar(
+        {}, {}, c.CONFIGURACAO_OFICIAL, _portao(),
+        {"Núcleo": [False], "Garimpo": [False]},
+        executor=lambda *_: _ato(False), gerador=_gerador_falso,
+    )
+    assert doc["completo"] and not doc["tarefas_seguir"]
+    assert doc["familias_concluidas"] == [c.asdict(x) for x in sequencial]
+
+
+def test_agregado_lista_extensao_e_depois_iguala_sequencial_k_um(tmp_path):
+    iniciais = [_linha_tarefa(i, aprovado=(i == 0)) for i in range(c.N_TAREFAS_INICIAIS)]
+    _gravar_linhas(tmp_path / "tarefas.jsonl", iniciais)
+    parcial = c.agregar_tarefas(tmp_path, tmp_path / "parcial.json")
+    esperadas = [n * len(c.FAMILIAS) for n in range(119, 188)]
+    assert parcial["tarefas_seguir"] == esperadas
+    extras = [_linha_tarefa(i) for i in esperadas]
+    _gravar_linhas(tmp_path / "extras.jsonl", extras)
+    final = c.agregar_tarefas(tmp_path, tmp_path / "final.json")
+    ar = next(x for x in final["familias_concluidas"] if x["familia"] == "ar_garch")
+    primeiro = True
+    def executor(*_):
+        nonlocal primeiro
+        atual, primeiro = primeiro, False
+        return _ato(atual)
+    (sequencial,) = c.calibrar(
+        {}, {}, c.CONFIGURACAO_OFICIAL, _portao(),
+        {"Núcleo": [False], "Garimpo": [False]},
+        executor=executor, gerador=_gerador_falso, familias=(FamiliaNula.AR_GARCH,),
+    )
+    assert ar == c.asdict(sequencial)
+
+
+def test_tarefa_grava_mundo_veredito_e_diagnosticos(monkeypatch, tmp_path):
+    from ferramentas import catalogo_publico_f29
+
+    monkeypatch.setattr(catalogo_publico_f29, "carregar", lambda *_: ({str(i): {} for i in range(81)},
+                                                                      {str(i): object() for i in range(81)}))
+    monkeypatch.setattr(c, "gerar_mundo", lambda familia, semente, *_: SimpleNamespace(
+        familia=familia, semente=semente))
+    monkeypatch.setattr(c, "executar_ato", lambda *a, **k: _ato(False))
+    saida = tmp_path / "tarefa.jsonl"
+    linha = c.executar_tarefa(7, 4, saida)
+    import json
+    assert json.loads(saida.read_text(encoding="utf-8")) == json.loads(json.dumps(linha))
+    assert (linha["familia"], linha["n"], linha["semente"]) == (
+        c.FAMILIAS[1].value, 1, c.SEMENTE_BASE + 601,
+    )
+    assert set(linha) >= {"aprovou_ato", "veredito", "execucao"}
