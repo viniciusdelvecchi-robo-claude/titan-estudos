@@ -41,5 +41,82 @@ def test_validacao_e_projecao_nao_rodam_mundo():
         cra.calibrar("V0", 0.03, lambda *_: {})
     custo = cra.projecao_custo()
     assert custo["mundos"] == 29
-    assert custo["teto_piloto_35min_por_ponto_horas"] == pytest.approx(16.92)
-    assert custo["teto_piloto_grade_inteira_horas"] == pytest.approx(186.08)
+    assert custo["tarefas"] == 29
+    assert custo["estimativa_linear_81_ativos_minutos_por_tarefa"] == pytest.approx(346.69)
+
+
+def test_tarefas_agregadas_iguais_ao_calibrar_sequencial(tmp_path):
+    assert cra.N_ATIVOS == 81
+    assert cra.N_TAREFAS == 29
+    linhas = []
+    for tarefa in range(cra.N_TAREFAS):
+        mundo_i = cra._coordenadas_tarefa(tarefa)
+        semente_execucao = cra.SEMENTE_BASE + mundo_i
+        semente_selecao = cra.SEMENTE_SELECAO_BASE + mundo_i
+        por_alvo = {}
+        for alvo in cra.GRADE_ALVOS:
+            por_m = {}
+            for m in cra.MS:
+                falha = (m == 0.50 and alvo >= 0.05 or m == 0.30 and alvo >= 0.30) and mundo_i == 0
+                por_m[f"{m:.2f}"] = {
+                    "revogou_alguma": falha, "partidas": 9, "partidas_revogadas": int(falha),
+                }
+            por_alvo[f"{alvo:.2f}"] = por_m
+        linhas.append(json.dumps({
+            "tarefa": tarefa, "semente_execucao": semente_execucao,
+            "semente_selecao": semente_selecao,
+            "variante": cra.VARIANTE_OFICIAL, "risco": cra.RISCO_OFICIAL,
+            "n_ativos": cra.N_ATIVOS, "por_alvo": por_alvo, "segundos": 1.0,
+        }))
+    (tmp_path / "tarefas.jsonl").write_text("\n".join(linhas) + "\n", encoding="utf-8")
+
+    def avaliar(semente, ms, alvo):
+        mundo_i = semente - cra.SEMENTE_BASE
+        return {
+            m: cra.ResumoMundo(
+                (m == 0.50 and alvo >= 0.05 or m == 0.30 and alvo >= 0.30) and mundo_i == 0,
+                9,
+                int((m == 0.50 and alvo >= 0.05 or m == 0.30 and alvo >= 0.30) and mundo_i == 0),
+            ) for m in ms
+        }
+
+    esperado = cra.calibrar(cra.VARIANTE_OFICIAL, cra.RISCO_OFICIAL, avaliar)
+    obtido = cra.agregar_tarefas(tmp_path, tmp_path / "agregado.json")
+    assert obtido == esperado
+
+
+def test_preparacao_compacta_igual_a_objetos_campo_a_campo(monkeypatch):
+    from titan import cadeia_garimpo as cg
+    from titan.aprendizagem import agenda, aplicar
+    from titan.sintetico import Vantagem, gerar_mundo
+
+    monkeypatch.setattr(cra, "REAMOSTRAGENS", 19)
+    semente, semente_selecao, n_dias, n_ativos = 771, 1771, 300, 1
+    prep = cra._preparar_mundo(
+        semente, "V3", 0.02, n_ativos=n_ativos, n_dias=n_dias,
+        semente_selecao=semente_selecao,
+    )
+    selecao = gerar_mundo(
+        semente_selecao, n_dias, n_ativos,
+        Vantagem("momento", cra._forca_momento_sharpe_2(), 0.5),
+    )
+    execucao = gerar_mundo(semente, n_dias, n_ativos, Vantagem())
+    brutas_selecao = cg.intencoes(selecao)
+    series = cg.series_isoladas(selecao, brutas_selecao, 0.02)
+    periodos = agenda("V3", selecao.dias, series, reamostragens=19, semente=semente_selecao)
+    brutas_execucao = cg.intencoes(execucao)
+    objetos = aplicar([i for s in sorted(brutas_execucao) for i in brutas_execucao[s]], periodos)
+    compactas = [prep.lotes[s].materializar(k) for s in sorted(prep.lotes) for k in range(len(prep.lotes[s]))]
+    assert compactas == objetos
+
+
+def test_tarefa_grava_as_duas_sementes(monkeypatch, tmp_path):
+    resumo = {m: cra.ResumoMundo(False, 10, 0) for m in cra.MS}
+    monkeypatch.setattr(cra, "_preparar_mundo", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cra, "_avaliar_preparado", lambda *args, **kwargs: resumo)
+    saida = tmp_path / "tarefa.jsonl"
+    linha = cra.executar_tarefa(3, 1, saida)
+    gravada = json.loads(saida.read_text(encoding="utf-8"))
+    assert linha == gravada
+    assert gravada["semente_execucao"] == 140_003
+    assert gravada["semente_selecao"] == 240_003
