@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+import json
 import math
 
 import pytest
@@ -194,3 +195,137 @@ def test_tempo_sem_capacidade_usa_dia_do_servidor():
                     180, False, "teste")
     resolver = f210._DiasEstados(SimpleNamespace(sessoes={"X": {d: sessao}}))
     assert resolver(datetime(2024, 1, 1, 22, tzinfo=UTC)) == d
+
+
+def test_risco_aberto_falha_fechado_ausente_ou_em_andamento(tmp_path):
+    ausente = tmp_path / "ausente.json"
+    with pytest.raises(FileNotFoundError):
+        f210.carregar_risco_aberto(ausente)
+    parcial = tmp_path / "parcial.json"
+    parcial.write_text(json.dumps({"status": "em_andamento"}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="em_andamento"):
+        f210.carregar_risco_aberto(parcial)
+
+
+def _risco_com_alvos(alvos):
+    pontos = []
+    for m in f210.MS:
+        if alvos[f"{m:.2f}"] is None:
+            pontos.append({
+                "m": m, "alvo": 0.05, "k_mundos": 3, "n_mundos": 29,
+                "limite_cp95": 0.2, "aprovado": False,
+            })
+    return {"status": "completo", "alvo_por_m": alvos, "pontos": pontos}
+
+
+def test_m_sem_alvo_e_aceito_e_nao_e_simulado(monkeypatch, tmp_path):
+    risco = tmp_path / "risco.json"
+    risco.write_text(json.dumps(_risco_com_alvos({
+        "0.20": 0.05, "0.30": 0.05, "0.50": None,
+    })), encoding="utf-8")
+    carregados = f210.carregar_risco_aberto(risco)
+    assert carregados == {0.2: 0.05, 0.3: 0.05, 0.5: None}
+    assert f210.numero_tarefas(carregados) == 58
+
+    mundo, intencoes = _mundo_pequeno()
+    monkeypatch.setattr(f210, "simular", _resultado_falso)
+    relatorio = f210.avaliar_viabilidade(
+        mundo, intencoes, _params(), carregados,
+        f210.FonteCDI(0.1, "fonte", "data"), sharpe_plantado=1.0,
+    )
+    assert {a.m for a in relatorio.agregados} == {0.2, 0.3}
+    assert all(p.m != 0.5 for p in relatorio.partidas)
+
+
+def test_nenhum_m_com_alvo_agrega_sem_tarefas_e_para(tmp_path):
+    risco = tmp_path / "risco.json"
+    risco.write_text(json.dumps(_risco_com_alvos({
+        "0.20": None, "0.30": None, "0.50": None,
+    })), encoding="utf-8")
+    artefatos = tmp_path / "artefatos"
+    artefatos.mkdir()
+    doc = f210.agregar_tarefas(
+        artefatos, tmp_path / "agregado.json", risco_path=risco,
+    )
+    assert doc["regra_parada"]["projeto_para_aqui"] is True
+    assert f210.numero_tarefas(f210.carregar_risco_aberto(risco)) == 0
+    assert doc["risco_aberto_por_m"] == {"0.20": None, "0.30": None, "0.50": None}
+    assert doc["agregados_por_cenario"] == {c: [] for c in f210.CENARIOS}
+    assert doc["situacao_por_m"]["0.50"] == {
+        "status": "sem_alvo_viavel",
+        "ponto_reprovado": {
+            "alvo": 0.05, "k_mundos": 3, "n_mundos": 29, "limite_cp95": 0.2,
+        },
+    }
+
+
+def _relatorio_minimo(cenario: str, ganho: float) -> f210.RelatorioViabilidade:
+    fonte = f210.FonteCDI(0.0959, "fonte", "referencia")
+    partidas = []
+    for m in f210.MS:
+        for degrau, fracao in f210.DEGRAUS:
+            metrica = f210.MetricasHorizonte(
+                3, 10, False, ganho, ganho / 3000, 10.0, 10 / 3000, 0, 0.1, 0.959,
+            )
+            partidas.append(f210.Partida(
+                date(2020, 1, 2), m, degrau, fracao, 0.5 * fracao,
+                replace(metrica, anos=1), metrica, (ganho,) * 36,
+            ))
+    return f210.RelatorioViabilidade(
+        fonte, {m: 0.5 for m in f210.MS}, tuple(partidas),
+        f210._agregar(partidas), 1.0 if cenario.endswith("sharpe_1") else None,
+        ganho <= 0 if cenario.endswith("sharpe_1") else None, "teste",
+    )
+
+
+def test_agregado_de_tarefas_igual_ao_sequencial(monkeypatch, tmp_path):
+    risco = tmp_path / "risco_teste.json"
+    risco.write_text(json.dumps({
+        "status": "completo", "alvo_por_m": {"0.20": 0.5, "0.30": 0.5, "0.50": 0.5},
+    }), encoding="utf-8")
+    relatorios = {
+        c: _relatorio_minimo(c, 100.0 if c.endswith("sharpe_1") else -10.0)
+        for c in f210.CENARIOS
+    }
+    linhas = []
+    for tarefa in range(f210.N_TAREFAS):
+        cenario, numero = f210._coordenadas_tarefa(tarefa)
+        s_exec = f210.SEMENTE_NULA_BASE + numero if cenario == "sem_vantagem" else f210.SEMENTE_VANTAGEM_BASE + numero
+        s_sel = f210.SEMENTE_SELECAO_NULA_BASE + numero if cenario == "sem_vantagem" else s_exec
+        linhas.append(json.dumps({
+            "tarefa": tarefa, "cenario": cenario, "numero": numero,
+            "semente_execucao": s_exec, "semente_selecao": s_sel,
+            "variante": f210.VARIANTE_OFICIAL, "risco": f210.RISCO_OFICIAL,
+            "n_ativos": f210.N_ATIVOS, "n_dias": f210.N_DIAS,
+            "risco_aberto_por_m": {"0.20": 0.5, "0.30": 0.5, "0.50": 0.5},
+            "relatorio": f210._relatorio_para_dict(relatorios[cenario]), "segundos": 1.0,
+        }))
+    (tmp_path / "tarefas.jsonl").write_text("\n".join(linhas) + "\n", encoding="utf-8")
+    esperado = f210.executar_sequencial(lambda c, _n, _r: relatorios[c], {m: 0.5 for m in f210.MS})
+    obtido = f210.agregar_tarefas(tmp_path, tmp_path / "agregado.json", risco_path=risco)
+    assert obtido == esperado
+
+
+def test_preparacao_oficial_compacta_igual_a_objetos(monkeypatch):
+    from titan import cadeia_garimpo as cg
+    from titan.aprendizagem import agenda, aplicar
+    from titan.sintetico import Vantagem, gerar_mundo
+
+    monkeypatch.setattr(f210, "REAMOSTRAGENS", 19)
+    prep = f210._preparar_cenario("sem_vantagem", 0, n_ativos=1, n_dias=300)
+    selecao = gerar_mundo(
+        f210.SEMENTE_SELECAO_NULA_BASE, 300, 1,
+        Vantagem("momento", f210._forca_momento(2.0), 0.5),
+    )
+    execucao = gerar_mundo(f210.SEMENTE_NULA_BASE, 300, 1, Vantagem())
+    brutas_sel = cg.intencoes(selecao)
+    series = cg.series_isoladas(selecao, brutas_sel, f210.RISCO_OFICIAL)
+    periodos = agenda("V3", selecao.dias, series, reamostragens=19,
+                      semente=f210.SEMENTE_SELECAO_NULA_BASE)
+    brutas_exec = cg.intencoes(execucao)
+    objetos = aplicar([i for s in sorted(brutas_exec) for i in brutas_exec[s]], periodos)
+    compactas = [
+        prep.lotes[s].materializar(k) for s in sorted(prep.lotes)
+        for k in range(len(prep.lotes[s]))
+    ]
+    assert compactas == objetos

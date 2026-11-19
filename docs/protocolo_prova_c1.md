@@ -204,3 +204,10 @@ alguma métrica já existir, a fatia está gasta (F3-4).
 
 **D7. Limite declarado (RG-2).** A calibração (F2-9) certifica a taxa de falso positivo de uma simulação, desde que
 valham as hipóteses dos mundos sintéticos; não é garantia sobre o mercado.
+
+**D8. Emenda de 18/11/2026 — B e semente do ato.** O ato usa `B = 499`: dá resolução mínima
+`1/(B+1) = 0,002`, suficiente para os níveis de 1% e 2%, sem multiplicar o custo do ato. A semente é o
+inteiro sem sinal de 64 bits, big-endian, dos oito primeiros bytes de
+`SHA256("AtaqueAoTitan|ato-c1|semente-v1|" || SHA256(bytes UTF-8 deste protocolo congelado depois de substituir
+cada par CRLF por LF, sem alterar CR isolado))`; são exatamente os bytes do blob Git neste arquivo de texto e, portanto, não pode
+ser escolhida depois de vistos os resultados. A série pessimista continua usando `semente + 1` (A6).
