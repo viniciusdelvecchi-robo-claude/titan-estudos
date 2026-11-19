@@ -43,6 +43,7 @@ FAMILIAS = tuple(FamiliaNula)
 N_TAREFAS_INICIAIS = len(FAMILIAS) * N_ZERO
 CATALOGO_PUBLICO = Path(__file__).resolve().parents[1] / "medidas" / "catalogo_f2_publico.json"
 SAIDA_AGREGADA = Path(__file__).resolve().parents[1] / "medidas" / "f2_9_calibracao.json"
+FAMILIA_HISTORIA_CEGA = "historia_sinal_embaralhado"
 PILOTO_8_ATIVOS_SEGUNDOS = 153.34
 ESTIMATIVA_LINEAR_81_ATIVOS_MINUTOS = round(PILOTO_8_ATIVOS_SEGUNDOS * 81 / 8 / 60, 2)
 
@@ -213,10 +214,12 @@ def executar_ato(
     *,
     processos: int = 1,
     exigir_nucleo: bool = True,
+    testador=None,
 ) -> ResultadoAto:
     """Roda Núcleo + Garimpo, normal + pessimista, e um único Holm."""
     from titan import cadeia_garimpo as cg
-    from titan.prova import testar
+    if testador is None:
+        from titan.prova import testar as testador
 
     risco = configuracao.risco_por_operacao  # C3: Núcleo usa o vencedor também
     garimpo = _preparar_garimpo(mundo, configuracao, params_portao, processos)
@@ -233,7 +236,7 @@ def executar_ato(
         diagnosticos[nome] = _diagnostico(intencoes, normal, pessimista)
     # Cada mundo recebe sementes de bootstrap independentes e reprodutíveis.
     portao = replace(params_portao, semente=mundo.semente)
-    return ResultadoAto(testar(entradas, portao), diagnosticos)
+    return ResultadoAto(testador(entradas, portao), diagnosticos)
 
 
 def _veredito_publicavel(v: VereditoPortao) -> dict[str, Any]:
@@ -437,9 +440,14 @@ def agregar_tarefas(pasta: Path, saida: Path = SAIDA_AGREGADA) -> dict[str, Any]
         "familias_concluidas": resumos,
         "familias_pendentes": pendentes,
         "tarefas_seguir": seguir,
-        "completo": not pendentes,
-        "historia_sinal_embaralhado": "fora: exigiria preço real",
+        "completo": False,
+        "tarefas_historia_seguir": list(range(N_ZERO)),
     }
+    pendentes.append({
+        "familia": FAMILIA_HISTORIA_CEGA, "n": 0, "k": 0,
+        "proximo_checkpoint": N_ZERO, "tarefas": list(range(N_ZERO)),
+        "executor": "calibracao_historia_cega_f29.py",
+    })
     saida.parent.mkdir(parents=True, exist_ok=True)
     tmp = saida.with_suffix(saida.suffix + ".tmp")
     tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")

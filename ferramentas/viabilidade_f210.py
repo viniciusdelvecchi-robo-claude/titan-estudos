@@ -31,17 +31,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from titan.motor import simular
 from titan.sintetico import Mundo
-from titan.tipos_f2 import EstadoRisco, Intencao, ParamsMotor, ResultadoMotor
+from titan.tipos_f2 import (
+    EstadoRisco, Intencao, MotivoRecusa, ParamsMotor, ResultadoMotor,
+)
 
 
 MS = (0.20, 0.30, 0.50)
 DEGRAUS = ((1, 1 / 3), (2, 2 / 3), (3, 1.0))
 DIAS_ANO = 260.3
-SEM_CAPACIDADE = {
+ESTADOS_RESTRITOS = {
     EstadoRisco.REDUCAO,
     EstadoRisco.DESCONHECIDA,
     EstadoRisco.REVOGADO,
 }
+ESQUEMA_METRICAS = 2
+DEFINICAO_TEMPO_SEM_CAPACIDADE = (
+    "Dia em estado REDUCAO, DESCONHECIDA ou REVOGADO; ou dia com ao menos "
+    "um sinal em que nenhum sinal abriu posicao e todas as recusas foram PISO_F. "
+    "Recusas por risco aberto, margem, limite diario, um terco ou lote minimo "
+    "sao limites de tamanho e nao contam como falta de capacidade."
+)
 
 # Desenho oficial congelado antes da primeira execucao F2-10. Os 29 mundos
 # independentes por cenario igualam a populacao da calibracao do risco aberto;
@@ -185,6 +194,9 @@ class MetricasHorizonte:
     dias_sem_capacidade: int
     volatilidade_anual: float
     sharpe_equilibrio_cdi: float
+    dias_em_estado_restrito: int
+    recusas_por_motivo: Mapping[str, int]
+    posicoes_abertas: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +248,12 @@ class Agregado:
     dias_sem_capacidade_mediano_3a: float
     volatilidade_mediana_3a: float
     sharpe_equilibrio_mediano_3a: float
+    dias_em_estado_restrito_mediano_1a: float
+    dias_em_estado_restrito_mediano_3a: float
+    recusas_medianas_1a_por_motivo: Mapping[str, float]
+    recusas_medianas_3a_por_motivo: Mapping[str, float]
+    posicoes_abertas_mediana_1a: float
+    posicoes_abertas_mediana_3a: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +413,15 @@ def _metricas(
     capital: float,
     dia_servidor=lambda t: t.date(),
 ) -> MetricasHorizonte:
+    """Mede um horizonte sem confundir capacidade com limites de tamanho.
+
+    Pela secao 4/F2-10, um dia fica sem capacidade se o motor estiver em estado
+    restrito (REDUCAO, DESCONHECIDA ou REVOGADO), ou se houver sinal, nenhuma
+    posicao abrir e todas as recusas desse dia forem PISO_F: a folga acima de F
+    nao comportou nenhuma posicao sinalizada. RISCO_ABERTO, MARGEM, LIMITE_DIA,
+    UM_TERCO e LOTE_MINIMO sao publicados, mas nao definem falta de capacidade.
+    ``dias_em_estado_restrito`` preserva, com nome honesto, a metrica anterior.
+    """
     pares = [(d, p) for d, p in zip(resultado.datas, resultado.pnl_usd) if inicio <= d < limite]
     patrimonio = capital
     pico = capital
@@ -411,14 +438,34 @@ def _metricas(
         queda_fracao = max(queda_fracao, queda / pico if pico > 0 else 1.0)
 
     estados = [(t, e) for t, e in resultado.estados if inicio <= dia_servidor(t) < limite]
-    dias_sem = {dia_servidor(t) for t, e in estados if e in SEM_CAPACIDADE}
+    dias_restritos = {dia_servidor(t) for t, e in estados if e in ESTADOS_RESTRITOS}
     revogou = any(e is EstadoRisco.REVOGADO for _, e in estados)
+    recusas = [r for r in resultado.recusas if inicio <= dia_servidor(r.instante) < limite]
+    aberturas = [
+        evento for evento in resultado.livro
+        if evento.get("evento") == "abertura"
+        and inicio <= dia_servidor(evento["instante"]) < limite
+    ]
+    motivos_por_dia: dict[date, list[MotivoRecusa]] = {}
+    for recusa in recusas:
+        motivos_por_dia.setdefault(dia_servidor(recusa.instante), []).append(recusa.motivo)
+    dias_com_abertura = {dia_servidor(evento["instante"]) for evento in aberturas}
+    dias_so_piso = {
+        dia for dia, motivos in motivos_por_dia.items()
+        if dia not in dias_com_abertura and motivos
+        and all(motivo is MotivoRecusa.PISO_F for motivo in motivos)
+    }
+    recusas_por_motivo = {
+        motivo.value: sum(r.motivo is motivo for r in recusas)
+        for motivo in MotivoRecusa
+    }
     vol = stdev(retornos) * math.sqrt(DIAS_ANO) if len(retornos) >= 2 else 0.0
     equilibrio = fonte_cdi.taxa_bruta_anual / vol if vol > 0 else math.inf
     anos = max(1, round((limite - inicio).days / 365.25))
     return MetricasHorizonte(
         anos, len(pares), revogou, patrimonio - capital, (patrimonio - capital) / capital,
-        queda_usd, queda_fracao, len(dias_sem), vol, equilibrio,
+        queda_usd, queda_fracao, len(dias_restritos | dias_so_piso), vol, equilibrio,
+        len(dias_restritos), recusas_por_motivo, len(aberturas),
     )
 
 
@@ -431,6 +478,16 @@ def _agregar(partidas: Sequence[Partida]) -> tuple[Agregado, ...]:
                 continue
             n = len(grupo)
             eq = [p.tres_anos.sharpe_equilibrio_cdi for p in grupo]
+            recusas_1a = {
+                motivo.value: median(
+                    p.um_ano.recusas_por_motivo[motivo.value] for p in grupo
+                ) for motivo in MotivoRecusa
+            }
+            recusas_3a = {
+                motivo.value: median(
+                    p.tres_anos.recusas_por_motivo[motivo.value] for p in grupo
+                ) for motivo in MotivoRecusa
+            }
             saida.append(Agregado(
                 m, degrau, fracao, grupo[0].risco_aberto_alvo, n,
                 sum(p.um_ano.revogou for p in grupo) / n,
@@ -447,6 +504,11 @@ def _agregar(partidas: Sequence[Partida]) -> tuple[Agregado, ...]:
                 median(p.tres_anos.dias_sem_capacidade for p in grupo),
                 median(p.tres_anos.volatilidade_anual for p in grupo),
                 median(eq),
+                median(p.um_ano.dias_em_estado_restrito for p in grupo),
+                median(p.tres_anos.dias_em_estado_restrito for p in grupo),
+                recusas_1a, recusas_3a,
+                median(p.um_ano.posicoes_abertas for p in grupo),
+                median(p.tres_anos.posicoes_abertas for p in grupo),
             ))
     return tuple(saida)
 
@@ -787,6 +849,13 @@ def _relatorio_de_dict(d: Mapping) -> RelatorioViabilidade:
         x = dict(x)
         if x["sharpe_equilibrio_cdi"] in ("Infinity", "-Infinity"):
             x["sharpe_equilibrio_cdi"] = float(x["sharpe_equilibrio_cdi"].replace("Infinity", "inf"))
+        exigidos = {"dias_em_estado_restrito", "recusas_por_motivo", "posicoes_abertas"}
+        faltantes = exigidos - x.keys()
+        if faltantes:
+            raise ValueError(
+                "artefato usa esquema antigo de metricas; faltam: "
+                + ", ".join(sorted(faltantes))
+            )
         return MetricasHorizonte(**x)
     partidas = tuple(Partida(
         date.fromisoformat(x["inicio"]), float(x["m"]), int(x["degrau"]),
@@ -832,6 +901,7 @@ def _consolidar(
             for m in MS if risco_aberto_por_m[m] is not None
         }
     return _jsonificavel({
+        "esquema_metricas": ESQUEMA_METRICAS,
         "status": "completo",
         "configuracao": {
             "variante": VARIANTE_OFICIAL, "risco_por_operacao": RISCO_OFICIAL,
@@ -862,6 +932,7 @@ def _consolidar(
         "risco_aberto_por_m": {f"{m:.2f}": risco_aberto_por_m[m] for m in MS},
         "situacao_por_m": situacao_por_m,
         "agregados_por_cenario": agregados,
+        "definicao_tempo_sem_capacidade": DEFINICAO_TEMPO_SEM_CAPACIDADE,
         "faixas_resultado_por_idade": [asdict(x) for x in faixas],
         "regra_parada": {
             "definicao": "para se nenhum M no degrau inteiro tem resultado mediano positivo em 3 anos sob Sharpe 1; M sem alvo viavel conta como nao positivo",
@@ -902,6 +973,7 @@ def executar_tarefa(
     prep = _preparar_cenario(cenario, numero, proc_interno, n_ativos=n_ativos, n_dias=n_dias)
     relatorio = _avaliar_compacto(prep, riscos)
     linha = {
+        "esquema_metricas": ESQUEMA_METRICAS,
         "tarefa": tarefa, "cenario": cenario, "numero": numero,
         "semente_execucao": prep.semente_execucao, "semente_selecao": prep.semente_selecao,
         "variante": VARIANTE_OFICIAL, "risco": RISCO_OFICIAL,
@@ -938,6 +1010,11 @@ def agregar_tarefas(
             if not bruto.strip():
                 continue
             d = json.loads(bruto)
+            if d.get("esquema_metricas") != ESQUEMA_METRICAS:
+                raise ValueError(
+                    f"artefato usa esquema de metricas {d.get('esquema_metricas')!r}; "
+                    f"exigido {ESQUEMA_METRICAS}"
+                )
             tarefa = int(d["tarefa"])
             if tarefa in por_tarefa:
                 raise ValueError(f"tarefa repetida: {tarefa}")

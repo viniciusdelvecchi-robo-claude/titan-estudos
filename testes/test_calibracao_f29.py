@@ -220,7 +220,9 @@ def test_agregado_falso_igual_ao_sequencial_k_zero(tmp_path):
         {"Núcleo": [False], "Garimpo": [False]},
         executor=lambda *_: _ato(False), gerador=_gerador_falso,
     )
-    assert doc["completo"] and not doc["tarefas_seguir"]
+    assert not doc["completo"] and not doc["tarefas_seguir"]
+    assert doc["tarefas_historia_seguir"] == list(range(119))
+    assert doc["familias_pendentes"][-1]["familia"] == "historia_sinal_embaralhado"
     assert doc["familias_concluidas"] == [c.asdict(x) for x in sequencial]
 
 

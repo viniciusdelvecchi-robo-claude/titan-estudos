@@ -26,7 +26,8 @@ def test_f2_6_cdi_publica_cambio_parado_e_historico_com_fontes_injetadas():
     assert r.saldo_dolar_parado_usd == 3000.0
     assert r.fonte_cdi is fonte_cdi and r.fonte_cambio is fonte_fx
 from titan.tipos_f2 import (
-    Campanha, EstadoRisco, Intencao, Lado, ParamsMotor, ResultadoMotor,
+    Campanha, EstadoRisco, Intencao, Lado, MotivoRecusa, ParamsMotor, Recusa,
+    ResultadoMotor,
 )
 from titan.visao import Barras
 
@@ -87,6 +88,12 @@ def test_relatorio_lado_a_lado_degraus_cdi_e_partidas_mensais(monkeypatch):
     assert all(p.um_ano.resultado_usd == 50.0 for p in r.partidas)
     assert all(p.tres_anos.resultado_usd == 150.0 for p in r.partidas)
     assert all(p.um_ano.dias_sem_capacidade == 1 for p in r.partidas)
+    assert all(p.um_ano.dias_em_estado_restrito == 1 for p in r.partidas)
+    assert all(a.posicoes_abertas_mediana_3a == 0 for a in r.agregados)
+    assert all(
+        set(a.recusas_medianas_3a_por_motivo) == {m.value for m in MotivoRecusa}
+        for a in r.agregados
+    )
     assert all(math.isfinite(p.tres_anos.sharpe_equilibrio_cdi) for p in r.partidas)
     assert r.projeto_para_aqui is False
     assert r.fonte_cdi.fonte == "Banco Central do Brasil"
@@ -183,6 +190,43 @@ def test_queda_maxima_e_revogacao_por_horizonte():
     assert m.queda_maxima_usd == 600.0
     assert m.queda_maxima_fracao == pytest.approx(600 / 3300)
     assert m.revogou and m.dias_sem_capacidade == 1
+    assert m.dias_em_estado_restrito == 1
+
+
+def test_tempo_sem_capacidade_diagnosticos_e_economia_inalterada():
+    fonte = f210.FonteCDI(0.1, "fonte", "data")
+    inicio = date(2024, 1, 2)
+    instantes = [datetime.combine(inicio + timedelta(days=n), datetime.min.time(), UTC)
+                 for n in range(4)]
+    base = ResultadoMotor(
+        tuple(inicio + timedelta(days=n) for n in range(4)),
+        (10.0, -20.0, 5.0, 0.0), (10 / 3000, -20 / 3000, 5 / 3000, 0.0),
+        (0.0,) * 4, (0.0,) * 4, (), (), (), (), (),
+    )
+    recusas = (
+        Recusa("p1", instantes[0], MotivoRecusa.PISO_F, {}),
+        Recusa("p2", instantes[0], MotivoRecusa.PISO_F, {}),
+        Recusa("m1", instantes[1], MotivoRecusa.MARGEM, {}),
+        Recusa("p3", instantes[2], MotivoRecusa.PISO_F, {}),
+    )
+    diagnosticado = replace(
+        base, recusas=recusas,
+        livro=({"evento": "abertura", "instante": instantes[2]},),
+        estados=((instantes[3], EstadoRisco.REDUCAO),),
+    )
+    sem = f210._metricas(base, inicio, inicio + timedelta(days=5), fonte, 3000.0)
+    com = f210._metricas(diagnosticado, inicio, inicio + timedelta(days=5), fonte, 3000.0)
+    campos_economicos = (
+        "resultado_usd", "resultado_sobre_capital", "queda_maxima_usd",
+        "queda_maxima_fracao", "revogou", "volatilidade_anual",
+        "sharpe_equilibrio_cdi",
+    )
+    assert all(getattr(sem, campo) == getattr(com, campo) for campo in campos_economicos)
+    assert com.dias_sem_capacidade == 2  # dia so PISO_F + dia em REDUCAO
+    assert com.dias_em_estado_restrito == 1
+    assert com.recusas_por_motivo[MotivoRecusa.PISO_F.value] == 3
+    assert com.recusas_por_motivo[MotivoRecusa.MARGEM.value] == 1
+    assert com.posicoes_abertas == 1
 
 
 def test_tempo_sem_capacidade_usa_dia_do_servidor():
@@ -266,6 +310,7 @@ def _relatorio_minimo(cenario: str, ganho: float) -> f210.RelatorioViabilidade:
         for degrau, fracao in f210.DEGRAUS:
             metrica = f210.MetricasHorizonte(
                 3, 10, False, ganho, ganho / 3000, 10.0, 10 / 3000, 0, 0.1, 0.959,
+                0, {motivo.value: 0 for motivo in MotivoRecusa}, 0,
             )
             partidas.append(f210.Partida(
                 date(2020, 1, 2), m, degrau, fracao, 0.5 * fracao,
@@ -293,6 +338,7 @@ def test_agregado_de_tarefas_igual_ao_sequencial(monkeypatch, tmp_path):
         s_exec = f210.SEMENTE_NULA_BASE + numero if cenario == "sem_vantagem" else f210.SEMENTE_VANTAGEM_BASE + numero
         s_sel = f210.SEMENTE_SELECAO_NULA_BASE + numero if cenario == "sem_vantagem" else s_exec
         linhas.append(json.dumps({
+            "esquema_metricas": f210.ESQUEMA_METRICAS,
             "tarefa": tarefa, "cenario": cenario, "numero": numero,
             "semente_execucao": s_exec, "semente_selecao": s_sel,
             "variante": f210.VARIANTE_OFICIAL, "risco": f210.RISCO_OFICIAL,
@@ -305,6 +351,18 @@ def test_agregado_de_tarefas_igual_ao_sequencial(monkeypatch, tmp_path):
     esperado = f210.executar_sequencial(lambda c, _n, _r: relatorios[c], {m: 0.5 for m in f210.MS})
     obtido = f210.agregar_tarefas(tmp_path, tmp_path / "agregado.json", risco_path=risco)
     assert obtido == esperado
+    assert obtido["esquema_metricas"] == f210.ESQUEMA_METRICAS
+    assert obtido["definicao_tempo_sem_capacidade"] == f210.DEFINICAO_TEMPO_SEM_CAPACIDADE
+
+
+def test_agregador_recusa_artefato_do_esquema_antigo(monkeypatch, tmp_path):
+    risco = tmp_path / "risco.json"
+    risco.write_text(json.dumps({
+        "status": "completo", "alvo_por_m": {"0.20": 0.5, "0.30": 0.5, "0.50": 0.5},
+    }), encoding="utf-8")
+    (tmp_path / "antigo.jsonl").write_text(json.dumps({"tarefa": 0}) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="esquema de metricas None; exigido 2"):
+        f210.agregar_tarefas(tmp_path, tmp_path / "agregado.json", risco_path=risco)
 
 
 def test_preparacao_oficial_compacta_igual_a_objetos(monkeypatch):
