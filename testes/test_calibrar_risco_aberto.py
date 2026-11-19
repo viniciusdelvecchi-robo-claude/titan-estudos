@@ -16,7 +16,7 @@ def test_grade_cp_parada_monotona_sementes_e_saida(tmp_path):
         out = {}
         for m in ms:
             # M=50% reprova já em 5%; M=30%, em 30%; M=20% passa a grade inteira.
-            falha = (m == 0.50 and alvo >= 0.05 or m == 0.30 and alvo >= 0.30) and semente == 140_000
+            falha = (m == 0.50 and alvo >= 0.05 or m == 0.30 and alvo >= 0.30) and semente == cra.SEMENTE_BASE
             out[m] = cra.ResumoMundo(falha, 9, int(falha))
         return out
 
@@ -31,7 +31,7 @@ def test_grade_cp_parada_monotona_sementes_e_saida(tmp_path):
     assert pontos_30[-1]["limite_cp95"] == pytest.approx(limite_superior(1, 29, 0.95))
     assert not any(0.50 in ms and alvo > 0.05 for _, ms, alvo in chamadas)
     assert json.loads(path.read_text(encoding="utf-8"))["status"] == "completo"
-    assert {s for s, _, _ in chamadas} == set(range(140_000, 140_029))
+    assert {s for s, _, _ in chamadas} == set(range(640_000, 640_029))
 
 
 def test_validacao_e_projecao_nao_rodam_mundo():
@@ -42,7 +42,8 @@ def test_validacao_e_projecao_nao_rodam_mundo():
     custo = cra.projecao_custo()
     assert custo["mundos"] == 29
     assert custo["tarefas"] == 29
-    assert custo["estimativa_linear_81_ativos_minutos_por_tarefa"] == pytest.approx(346.69)
+    assert custo["estimativa_linear_81_ativos_minutos_por_tarefa"] == pytest.approx(415.8)
+    assert custo["estimativa_github_81_ativos_fator_2x_minutos_por_tarefa"] == pytest.approx(207.9)
 
 
 def test_tarefas_agregadas_iguais_ao_calibrar_sequencial(tmp_path):
@@ -66,7 +67,8 @@ def test_tarefas_agregadas_iguais_ao_calibrar_sequencial(tmp_path):
             "tarefa": tarefa, "semente_execucao": semente_execucao,
             "semente_selecao": semente_selecao,
             "variante": cra.VARIANTE_OFICIAL, "risco": cra.RISCO_OFICIAL,
-            "n_ativos": cra.N_ATIVOS, "por_alvo": por_alvo, "segundos": 1.0,
+            "n_ativos": cra.N_ATIVOS, "candidato_operacional": cra.CANDIDATO_OPERACIONAL,
+            "por_alvo": por_alvo, "segundos": 1.0,
         }))
     (tmp_path / "tarefas.jsonl").write_text("\n".join(linhas) + "\n", encoding="utf-8")
 
@@ -88,7 +90,8 @@ def test_tarefas_agregadas_iguais_ao_calibrar_sequencial(tmp_path):
 def test_preparacao_compacta_igual_a_objetos_campo_a_campo(monkeypatch):
     from titan import cadeia_garimpo as cg
     from titan.aprendizagem import agenda, aplicar
-    from titan.sintetico import Vantagem, gerar_mundo
+    from titan.regras import Nucleo
+    from titan.sintetico import Vantagem
 
     monkeypatch.setattr(cra, "REAMOSTRAGENS", 19)
     semente, semente_selecao, n_dias, n_ativos = 771, 1771, 300, 1
@@ -96,11 +99,11 @@ def test_preparacao_compacta_igual_a_objetos_campo_a_campo(monkeypatch):
         semente, "V3", 0.02, n_ativos=n_ativos, n_dias=n_dias,
         semente_selecao=semente_selecao,
     )
-    selecao = gerar_mundo(
+    selecao = cra._gerar_mundo_operacional(
         semente_selecao, n_dias, n_ativos,
         Vantagem("momento", cra._forca_momento_sharpe_2(), 0.5),
     )
-    execucao = gerar_mundo(semente, n_dias, n_ativos, Vantagem())
+    execucao = cra._gerar_mundo_operacional(semente, n_dias, n_ativos, Vantagem())
     brutas_selecao = cg.intencoes(selecao)
     series = cg.series_isoladas(selecao, brutas_selecao, 0.02)
     periodos = agenda("V3", selecao.dias, series, reamostragens=19, semente=semente_selecao)
@@ -108,6 +111,21 @@ def test_preparacao_compacta_igual_a_objetos_campo_a_campo(monkeypatch):
     objetos = aplicar([i for s in sorted(brutas_execucao) for i in brutas_execucao[s]], periodos)
     compactas = [prep.lotes[s].materializar(k) for s in sorted(prep.lotes) for k in range(len(prep.lotes[s]))]
     assert compactas == objetos
+    assert set(prep.mundo.m15) == {"Usa500"}
+    assert prep.mundo.specs["Usa500"].classe == "indice_spot"
+    assert any(i.regra_id == Nucleo.regra_id for i in compactas)
+
+
+def test_faixas_novas_de_sementes_sao_independentes_das_anteriores():
+    novas = set(range(cra.SEMENTE_BASE, cra.SEMENTE_BASE + cra.N_MUNDOS)) | set(
+        range(cra.SEMENTE_SELECAO_BASE, cra.SEMENTE_SELECAO_BASE + cra.N_MUNDOS)
+    )
+    anteriores = set(range(130_000, 139_020)) | set(range(140_000, 140_029)) | set(
+        range(240_000, 240_029)
+    ) | set(range(340_000, 340_029)) | set(range(440_000, 440_029)) | set(
+        range(540_000, 540_029)
+    ) | set(range(900_000, 903_600))
+    assert not (novas & anteriores)
 
 
 def test_tarefa_grava_as_duas_sementes(monkeypatch, tmp_path):
@@ -118,5 +136,5 @@ def test_tarefa_grava_as_duas_sementes(monkeypatch, tmp_path):
     linha = cra.executar_tarefa(3, 1, saida)
     gravada = json.loads(saida.read_text(encoding="utf-8"))
     assert linha == gravada
-    assert gravada["semente_execucao"] == 140_003
-    assert gravada["semente_selecao"] == 240_003
+    assert gravada["semente_execucao"] == 640_003
+    assert gravada["semente_selecao"] == 740_003

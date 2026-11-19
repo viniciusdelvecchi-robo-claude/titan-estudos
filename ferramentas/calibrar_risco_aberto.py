@@ -8,7 +8,12 @@ Uso (depois de F2-12 congelar a configuração)::
 
 A saída agregada é ``medidas/f2_10_risco_aberto.json``. Nada neste arquivo usa
 preço real. Cada tarefa prepara o mundo plantado de seleção e o mundo nulo de
-execução, pode paralelizar os ativos e avalia os onze alvos para os três M.
+execução, pode paralelizar os ativos e avalia os onze alvos para os três M. Os
+mundos usam os 81 símbolos e classes do catálogo público; assim o
+Garimpo operacional contém o Núcleo literal B6, conforme a precedência D3.
+
+Sementes desta correção (independentes de F2-12, F2-9 e das rodadas F2-10
+inválidas): execução nula 640000--640028 e seleção Sharpe 2 740000--740028.
 
 Unidade estatística
 -------------------
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import json
 import math
 from pathlib import Path
@@ -43,8 +49,8 @@ MS = (0.20, 0.30, 0.50)
 TETO_REVOGACAO = 0.10
 CONFIANCA = 0.95
 N_MUNDOS = n_minimo(TETO_REVOGACAO, k_admitido=0, confianca=CONFIANCA)
-SEMENTE_BASE = 140_000
-SEMENTE_SELECAO_BASE = 240_000
+SEMENTE_BASE = 640_000
+SEMENTE_SELECAO_BASE = 740_000
 N_DIAS = 1_240
 N_ATIVOS = 81
 REAMOSTRAGENS = 499
@@ -52,10 +58,13 @@ PESSIMISTA = True
 VARIANTE_OFICIAL = "V3"
 RISCO_OFICIAL = 0.02
 N_TAREFAS = N_MUNDOS
-PILOTO_8_ATIVOS_PREPARO_SEGUNDOS = 323.49
-PILOTO_8_ATIVOS_PARTIDAS_SEGUNDOS = 1_730.97
+PILOTO_8_ATIVOS_PREPARO_SEGUNDOS = 368.088
+PILOTO_8_ATIVOS_UM_ALVO_3M_SEGUNDOS = 190.539
+PILOTO_8_ATIVOS_PARTIDAS_SEGUNDOS = PILOTO_8_ATIVOS_UM_ALVO_3M_SEGUNDOS * len(GRADE_ALVOS)
 SAIDA_PADRAO = Path(__file__).resolve().parents[1] / "medidas" / "f2_10_risco_aberto.json"
 FORCAS_PATH = Path(__file__).resolve().parents[1] / "medidas" / "f2_12_forcas_vantagem.json"
+CATALOGO_PUBLICO = Path(__file__).resolve().parents[1] / "medidas" / "catalogo_f2_publico.json"
+CANDIDATO_OPERACIONAL = "Garimpo V3 2% com Nucleo literal B6 (precedencia D3)"
 
 
 def _forca_momento_sharpe_2() -> float:
@@ -67,6 +76,67 @@ def _forca_momento_sharpe_2() -> float:
     if not math.isfinite(forca) or forca <= 0:
         raise ValueError("forca congelada de momento Sharpe 2 deve ser positiva e finita")
     return forca
+
+
+@lru_cache(maxsize=1)
+def _simbolos_e_specs_catalogo() -> tuple[tuple[str, ...], Mapping[str, object]]:
+    """Ordem estável, com os 12 símbolos do Núcleo primeiro, e classes reais."""
+    from ferramentas.catalogo_publico_f29 import carregar
+    from titan.regras import PREGOES
+
+    _, specs = carregar(CATALOGO_PUBLICO)
+    faltam = set(PREGOES) - set(specs)
+    if faltam:
+        raise ValueError(f"catalogo publico sem indices do Nucleo: {sorted(faltam)}")
+    ordem = tuple(PREGOES) + tuple(sorted(set(specs) - set(PREGOES)))
+    if len(ordem) != N_ATIVOS:
+        raise ValueError(f"catalogo publico deve conter {N_ATIVOS} ativos, recebeu {len(ordem)}")
+    return ordem, specs
+
+
+def _gerar_mundo_operacional(semente: int, n_dias: int, n_ativos: int, vantagem):
+    """Liga nomes e classes reais antes de executar a gramática.
+
+    As sessões sintéticas regulares preservam o desenho plantado do F2-12. A
+    troca ocorre antes de ``cg.preparar``; portanto PREGOES ativa B6 tanto no
+    caminho de objetos quanto no compacto, sem duplicar o Núcleo fora do
+    Garimpo (D3: se ambos passam, opera-se o Garimpo que já o contém).
+    """
+    from titan.sintetico import Mundo, gerar_mundo
+
+    ordem, specs_catalogo = _simbolos_e_specs_catalogo()
+    if not 1 <= n_ativos <= len(ordem):
+        raise ValueError(f"n_ativos deve estar entre 1 e {len(ordem)}")
+    bruto = gerar_mundo(semente, n_dias, n_ativos, vantagem)
+    origens, destinos = sorted(bruto.m15), ordem[:n_ativos]
+    mapa = dict(zip(origens, destinos, strict=True))
+    return Mundo(
+        bruto.dias,
+        {mapa[s]: bruto.m15[s] for s in origens},
+        {mapa[s]: {d: replace(x, simbolo=mapa[s]) for d, x in bruto.sessoes[s].items()} for s in origens},
+        {
+            mapa[s]: replace(
+                bruto.specs[s], simbolo=mapa[s], classe=specs_catalogo[mapa[s]].classe,
+            )
+            for s in origens
+        },
+        tuple(mapa[s] for s in bruto.com_vantagem),
+        {mapa[s]: lado for s, lado in bruto.lado_plantado.items()},
+    )
+
+
+def _exigir_b6(lotes: Mapping[str, object]) -> None:
+    """Falha fechado se o caminho preparado não contiver sinais crus do Núcleo."""
+    from titan.regras import Nucleo, PREGOES
+
+    for simbolo in set(PREGOES) & set(lotes):
+        lote = lotes[simbolo]
+        ids = getattr(lote, "regra_ids", ())
+        if Nucleo.regra_id in ids:
+            codigo = ids.index(Nucleo.regra_id)
+            if any(int(x) == codigo for x in lote.regra):
+                return
+    raise RuntimeError("candidato operacional sem sinais do Nucleo literal B6")
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +159,7 @@ class PontoGrade:
 
 
 def projecao_custo() -> dict[str, float | int | str]:
-    """Projeção linear do piloto local de 8 ativos, medido em 18/11/2026."""
+    """Projeção do piloto 8 ativos medido em 19/11/2026, sem rodada oficial."""
     fator = N_ATIVOS / 8
     preparo = PILOTO_8_ATIVOS_PREPARO_SEGUNDOS * fator
     partidas = PILOTO_8_ATIVOS_PARTIDAS_SEGUNDOS * fator
@@ -99,6 +169,7 @@ def projecao_custo() -> dict[str, float | int | str]:
         "tarefas": N_TAREFAS,
         "alvos_por_tarefa": len(GRADE_ALVOS),
         "piloto_8_ativos_preparo_segundos": PILOTO_8_ATIVOS_PREPARO_SEGUNDOS,
+        "piloto_8_ativos_um_alvo_10_partidas_3m_segundos": PILOTO_8_ATIVOS_UM_ALVO_3M_SEGUNDOS,
         "piloto_8_ativos_partidas_11x3m_segundos": PILOTO_8_ATIVOS_PARTIDAS_SEGUNDOS,
         "piloto_8_ativos_total_segundos": (
             PILOTO_8_ATIVOS_PREPARO_SEGUNDOS + PILOTO_8_ATIVOS_PARTIDAS_SEGUNDOS
@@ -106,11 +177,12 @@ def projecao_custo() -> dict[str, float | int | str]:
         "estimativa_linear_81_ativos_preparo_minutos": round(preparo / 60, 2),
         "estimativa_linear_81_ativos_partidas_minutos": round(partidas / 60, 2),
         "estimativa_linear_81_ativos_minutos_por_tarefa": round(estimado / 60, 2),
+        "estimativa_github_81_ativos_fator_2x_minutos_por_tarefa": round(estimado / 120, 2),
         "estimativa_linear_total_horas": round(N_TAREFAS * estimado / 3600, 2),
         "observacao": (
-            "Piloto com seleção momento Sharpe 2 e execução nula: 152403 intenções após V3, "
-            "10 partidas mensais x 3 M x 11 alvos. A extrapolação linear fica apenas 3,31 min "
-            "abaixo do teto de 350 min; medir 81 ativos no GitHub é obrigatório antes do disparo."
+            "Piloto corrigido: 182265 intencoes, 10 partidas; preparo completo e um alvo x 3 M "
+            "medidos, demais dez alvos projetados pelo mesmo kernel. A estimativa GitHub usa o fator "
+            "2x ja medido no F2-12 e fica abaixo do teto de 350 min; medir uma tarefa antes do disparo total."
         ),
     }
 
@@ -144,6 +216,11 @@ def _documento(
                 "fim_inclusivo": SEMENTE_SELECAO_BASE + N_MUNDOS - 1,
             },
         },
+        "candidato_operacional": {
+            "nome": CANDIDATO_OPERACIONAL,
+            "precedencia_d3": "se ambos passam, opera-se o Garimpo, que contem o Nucleo B6; nao se somam candidatos",
+            "universo": "81 simbolos e classes de medidas/catalogo_f2_publico.json; demais parametros sinteticos preservam a vantagem plantada",
+        },
         "garimpo": {
             "variante": variante,
             "risco_por_operacao": risco_por_operacao,
@@ -154,12 +231,9 @@ def _documento(
             "execucao": "mundo nulo independente; todo P&L, risco aberto e revogação vêm dele",
         },
         "nucleo": {
-            "incluido": False,
-            "motivo": "entra apenas no F2-9",
-            "vies_esperado": (
-                "Omiti-lo tende a subestimar exposição/revogação e escolher alvo alto demais; "
-                "a direção não é garantia matemática porque o P&L do Núcleo também pode sustentar o patrimônio."
-            ),
+            "incluido": True,
+            "forma": "regra literal B6 dentro da gramatica do Garimpo, ativada pelos simbolos PREGOES",
+            "sem_duplicacao": "o Nucleo candidato nao e concatenado ao Garimpo por causa da precedencia D3",
         },
         "pontos": [p.__dict__ if hasattr(p, "__dict__") else {
             "m": p.m, "alvo": p.alvo, "k_mundos": p.k_mundos, "n_mundos": p.n_mundos,
@@ -277,15 +351,16 @@ def _preparar_mundo(
     from ferramentas.viabilidade_f210 import _DiasEstados, _primeiros_pregoes_mensais, _somar_anos
     from titan import cadeia_garimpo as cg
     from titan.aprendizagem import agenda, aplicar_compacto
-    from titan.sintetico import Vantagem, gerar_mundo
+    from titan.sintetico import Vantagem
 
     if semente_selecao is None:
         semente_selecao = SEMENTE_SELECAO_BASE + (semente - SEMENTE_BASE)
-    selecao = gerar_mundo(
+    selecao = _gerar_mundo_operacional(
         semente_selecao, n_dias, n_ativos,
         Vantagem("momento", _forca_momento_sharpe_2(), 0.5),
     )
     brutas_selecao, por_risco = cg.preparar(selecao, (risco,), processos=processos)
+    _exigir_b6(brutas_selecao)
     series = por_risco[risco]
     periodos = agenda(
         variante, selecao.dias, series,
@@ -294,10 +369,11 @@ def _preparar_mundo(
     simbolos_selecao = set(selecao.m15)
     lotes_selecao = set(brutas_selecao)
     del selecao, brutas_selecao, por_risco, series
-    mundo = gerar_mundo(semente, n_dias, n_ativos, Vantagem())
+    mundo = _gerar_mundo_operacional(semente, n_dias, n_ativos, Vantagem())
     if simbolos_selecao != set(mundo.m15):
         raise ValueError("simbolos dos mundos de selecao e execucao divergem")
     brutas_execucao, _ = cg.preparar(mundo, (), processos=processos)
+    _exigir_b6(brutas_execucao)
     if lotes_selecao != set(brutas_execucao):
         raise ValueError("lotes dos mundos de selecao e execucao divergem")
     lotes = aplicar_compacto(brutas_execucao, periodos)
@@ -392,6 +468,7 @@ def executar_tarefa(numero: int, proc_interno: int, saida: Path) -> dict:
     linha = {
         "tarefa": numero, "semente_execucao": semente, "semente_selecao": semente_selecao,
         "variante": VARIANTE_OFICIAL, "risco": RISCO_OFICIAL, "n_ativos": N_ATIVOS,
+        "candidato_operacional": CANDIDATO_OPERACIONAL,
         "por_alvo": por_alvo,
         "segundos": round(time.time() - t0, 1),
     }
@@ -415,11 +492,11 @@ def agregar_tarefas(pasta: Path, saida: Path = SAIDA_PADRAO) -> dict:
             mundo_i = _coordenadas_tarefa(numero)
             esperado = (
                 SEMENTE_BASE + mundo_i, SEMENTE_SELECAO_BASE + mundo_i,
-                VARIANTE_OFICIAL, RISCO_OFICIAL, N_ATIVOS,
+                VARIANTE_OFICIAL, RISCO_OFICIAL, N_ATIVOS, CANDIDATO_OPERACIONAL,
             )
             obtido = (
                 d["semente_execucao"], d["semente_selecao"],
-                d["variante"], d["risco"], d["n_ativos"],
+                d["variante"], d["risco"], d["n_ativos"], d.get("candidato_operacional"),
             )
             alvos_ok = set(d["por_alvo"]) == {f"{a:.2f}" for a in GRADE_ALVOS}
             ms_ok = all(set(x) == {f"{m:.2f}" for m in MS} for x in d["por_alvo"].values())

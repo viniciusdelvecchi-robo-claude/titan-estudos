@@ -296,6 +296,7 @@ def test_agregado_de_tarefas_igual_ao_sequencial(monkeypatch, tmp_path):
             "tarefa": tarefa, "cenario": cenario, "numero": numero,
             "semente_execucao": s_exec, "semente_selecao": s_sel,
             "variante": f210.VARIANTE_OFICIAL, "risco": f210.RISCO_OFICIAL,
+            "candidato_operacional": f210.CANDIDATO_OPERACIONAL,
             "n_ativos": f210.N_ATIVOS, "n_dias": f210.N_DIAS,
             "risco_aberto_por_m": {"0.20": 0.5, "0.30": 0.5, "0.50": 0.5},
             "relatorio": f210._relatorio_para_dict(relatorios[cenario]), "segundos": 1.0,
@@ -309,15 +310,16 @@ def test_agregado_de_tarefas_igual_ao_sequencial(monkeypatch, tmp_path):
 def test_preparacao_oficial_compacta_igual_a_objetos(monkeypatch):
     from titan import cadeia_garimpo as cg
     from titan.aprendizagem import agenda, aplicar
-    from titan.sintetico import Vantagem, gerar_mundo
+    from ferramentas.calibrar_risco_aberto import _gerar_mundo_operacional
+    from titan.sintetico import Vantagem
 
     monkeypatch.setattr(f210, "REAMOSTRAGENS", 19)
     prep = f210._preparar_cenario("sem_vantagem", 0, n_ativos=1, n_dias=300)
-    selecao = gerar_mundo(
+    selecao = _gerar_mundo_operacional(
         f210.SEMENTE_SELECAO_NULA_BASE, 300, 1,
         Vantagem("momento", f210._forca_momento(2.0), 0.5),
     )
-    execucao = gerar_mundo(f210.SEMENTE_NULA_BASE, 300, 1, Vantagem())
+    execucao = _gerar_mundo_operacional(f210.SEMENTE_NULA_BASE, 300, 1, Vantagem())
     brutas_sel = cg.intencoes(selecao)
     series = cg.series_isoladas(selecao, brutas_sel, f210.RISCO_OFICIAL)
     periodos = agenda("V3", selecao.dias, series, reamostragens=19,
@@ -329,3 +331,17 @@ def test_preparacao_oficial_compacta_igual_a_objetos(monkeypatch):
         for k in range(len(prep.lotes[s]))
     ]
     assert compactas == objetos
+
+
+def test_sementes_corrigidas_sao_disjuntas_entre_si_e_do_risco_aberto():
+    faixas = [
+        set(range(base, base + f210.N_MUNDOS_POR_CENARIO))
+        for base in (
+            f210.SEMENTE_NULA_BASE,
+            f210.SEMENTE_SELECAO_NULA_BASE,
+            f210.SEMENTE_VANTAGEM_BASE,
+        )
+    ]
+    assert all(not (faixas[i] & faixas[j]) for i in range(3) for j in range(i))
+    risco_novo = set(range(640_000, 640_029)) | set(range(740_000, 740_029))
+    assert all(not (x & risco_novo) for x in faixas)

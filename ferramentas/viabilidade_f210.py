@@ -3,7 +3,13 @@
 Este módulo não escolhe o risco aberto alvo. A seção 4 manda calibrá-lo como o
 maior valor cuja revogação em três anos, em mundos sem vantagem, tenha limite
 superior CP95% de no máximo 10%. Por isso ``risco_aberto_por_m`` é uma entrada
-obrigatória, já produzida por essa calibração.
+obrigatória, já produzida por essa calibração. Os mundos usam símbolos e
+classes do catálogo público para que o Garimpo operacional inclua
+o Núcleo literal B6 sem duplicá-lo, conforme a precedência D3.
+
+Sementes desta correção, independentes de todas as rodadas anteriores: execução
+nula 650000--650028, seleção nula Sharpe 2 750000--750028 e vantagem Sharpe 1
+850000--850028.
 """
 
 from __future__ import annotations
@@ -49,13 +55,16 @@ CENARIOS = ("sem_vantagem", "com_vantagem_sharpe_1")
 N_TAREFAS = len(CENARIOS) * N_MUNDOS_POR_CENARIO
 REAMOSTRAGENS = 499
 PESSIMISTA = True
-SEMENTE_NULA_BASE = 340_000
-SEMENTE_SELECAO_NULA_BASE = 440_000
-SEMENTE_VANTAGEM_BASE = 540_000
-PILOTO_8_ATIVOS_SEGUNDOS = 661.4
+SEMENTE_NULA_BASE = 650_000
+SEMENTE_SELECAO_NULA_BASE = 750_000
+SEMENTE_VANTAGEM_BASE = 850_000
+PILOTO_8_ATIVOS_PREPARO_SEGUNDOS = 368.088
+PILOTO_8_ATIVOS_90_SIMULACOES_SEGUNDOS = 3 * 190.539
+PILOTO_8_ATIVOS_SEGUNDOS = PILOTO_8_ATIVOS_PREPARO_SEGUNDOS + PILOTO_8_ATIVOS_90_SIMULACOES_SEGUNDOS
 FORCAS_PATH = Path(__file__).resolve().parents[1] / "medidas" / "f2_12_forcas_vantagem.json"
 RISCO_ABERTO_PATH = Path(__file__).resolve().parents[1] / "medidas" / "f2_10_risco_aberto.json"
 SAIDA_PADRAO = Path(__file__).resolve().parents[1] / "medidas" / "f2_10_viabilidade.json"
+CANDIDATO_OPERACIONAL = "Garimpo V3 2% com Nucleo literal B6 (precedencia D3)"
 
 
 def numero_tarefas(risco_aberto_por_m: Mapping[float, float | None]) -> int:
@@ -584,11 +593,13 @@ def _forca_momento(sharpe: float) -> float:
 
 
 def projecao_custo() -> dict[str, float | str]:
-    """Extrapolacao linear do pior caso medido: tarefa nula condicionada."""
+    """Projeta o pior caso a partir do kernel 8 ativos medido em 19/11/2026."""
     segundos_81 = PILOTO_8_ATIVOS_SEGUNDOS * N_ATIVOS / 8
     return {
         "piloto_8_ativos_segundos": PILOTO_8_ATIVOS_SEGUNDOS,
-        "piloto": "cenario nulo; 1240 dias; preparo de selecao e execucao; 90 simulacoes",
+        "piloto_8_ativos_preparo_segundos": PILOTO_8_ATIVOS_PREPARO_SEGUNDOS,
+        "piloto_8_ativos_90_simulacoes_segundos": PILOTO_8_ATIVOS_90_SIMULACOES_SEGUNDOS,
+        "piloto": "preparo corrigido medido; 90 simulacoes projetadas como 3x o alvo de 30 simulacoes medido no mesmo kernel",
         "estimativa_linear_81_ativos_minutos_notebook": round(segundos_81 / 60, 2),
         "estimativa_gitHub_minutos_com_fator_2x_medido_no_f2_12": round(segundos_81 / 120, 2),
     }
@@ -636,7 +647,8 @@ def _preparar_cenario(
     """
     from titan import cadeia_garimpo as cg
     from titan.aprendizagem import agenda, aplicar_compacto
-    from titan.sintetico import Vantagem, gerar_mundo
+    from ferramentas.calibrar_risco_aberto import _exigir_b6, _gerar_mundo_operacional
+    from titan.sintetico import Vantagem
 
     if cenario not in CENARIOS or not 0 <= numero < N_MUNDOS_POR_CENARIO:
         raise ValueError("coordenada de mundo F2-10 invalida")
@@ -645,30 +657,33 @@ def _preparar_cenario(
     if cenario == "sem_vantagem":
         semente_execucao = SEMENTE_NULA_BASE + numero
         semente_selecao = SEMENTE_SELECAO_NULA_BASE + numero
-        selecao = gerar_mundo(
+        selecao = _gerar_mundo_operacional(
             semente_selecao, n_dias, n_ativos,
             Vantagem("momento", _forca_momento(2.0), 0.5),
         )
         brutas_sel, por_risco = cg.preparar(selecao, (RISCO_OFICIAL,), processos=processos)
+        _exigir_b6(brutas_sel)
         periodos = agenda(
             VARIANTE_OFICIAL, selecao.dias, por_risco[RISCO_OFICIAL],
             reamostragens=REAMOSTRAGENS, semente=semente_selecao,
         )
         simbolos = set(selecao.m15)
-        mundo = gerar_mundo(semente_execucao, n_dias, n_ativos, Vantagem())
+        mundo = _gerar_mundo_operacional(semente_execucao, n_dias, n_ativos, Vantagem())
         if simbolos != set(mundo.m15):
             raise ValueError("simbolos dos mundos de selecao e execucao divergem")
         brutas, _ = cg.preparar(mundo, (), processos=processos)
+        _exigir_b6(brutas)
         if set(brutas_sel) != set(brutas):
             raise ValueError("lotes dos mundos de selecao e execucao divergem")
     else:
         semente_execucao = SEMENTE_VANTAGEM_BASE + numero
         semente_selecao = semente_execucao
-        mundo = gerar_mundo(
+        mundo = _gerar_mundo_operacional(
             semente_execucao, n_dias, n_ativos,
             Vantagem("momento", _forca_momento(1.0), 0.5),
         )
         brutas, por_risco = cg.preparar(mundo, (RISCO_OFICIAL,), processos=processos)
+        _exigir_b6(brutas)
         periodos = agenda(
             VARIANTE_OFICIAL, mundo.dias, por_risco[RISCO_OFICIAL],
             reamostragens=REAMOSTRAGENS, semente=semente_execucao,
@@ -822,6 +837,7 @@ def _consolidar(
             "variante": VARIANTE_OFICIAL, "risco_por_operacao": RISCO_OFICIAL,
             "n_ativos": N_ATIVOS, "n_dias": N_DIAS, "pessimista": PESSIMISTA,
             "reamostragens": REAMOSTRAGENS,
+            "candidato_operacional": CANDIDATO_OPERACIONAL,
         },
         "desenho": {
             "mundos_por_cenario": N_MUNDOS_POR_CENARIO,
@@ -838,6 +854,8 @@ def _consolidar(
                 "selecao_nula_sharpe_2": [SEMENTE_SELECAO_NULA_BASE, SEMENTE_SELECAO_NULA_BASE + N_MUNDOS_POR_CENARIO - 1],
                 "vantagem_sharpe_1": [SEMENTE_VANTAGEM_BASE, SEMENTE_VANTAGEM_BASE + N_MUNDOS_POR_CENARIO - 1],
             },
+            "precedencia_d3": "se ambos passam, opera-se o Garimpo, que contem o Nucleo B6; nao se somam candidatos",
+            "universo": "81 simbolos e classes de medidas/catalogo_f2_publico.json; demais parametros sinteticos preservam a vantagem plantada",
             "unidade": "mundo independente; partidas mensais sobrepostas sao descritivas",
         },
         "fonte_cdi": asdict(FONTE_CDI_OFICIAL),
@@ -887,6 +905,7 @@ def executar_tarefa(
         "tarefa": tarefa, "cenario": cenario, "numero": numero,
         "semente_execucao": prep.semente_execucao, "semente_selecao": prep.semente_selecao,
         "variante": VARIANTE_OFICIAL, "risco": RISCO_OFICIAL,
+        "candidato_operacional": CANDIDATO_OPERACIONAL,
         "n_ativos": n_ativos, "n_dias": n_dias,
         "risco_aberto_por_m": {f"{m:.2f}": riscos[m] for m in MS},
         "relatorio": _relatorio_para_dict(relatorio),
@@ -928,10 +947,12 @@ def agregar_tarefas(
             esperado = (
                 cenario, numero, s_exec, s_sel, VARIANTE_OFICIAL, RISCO_OFICIAL,
                 N_ATIVOS, N_DIAS, {f"{m:.2f}": riscos[m] for m in MS},
+                CANDIDATO_OPERACIONAL,
             )
             obtido = (
                 d["cenario"], d["numero"], d["semente_execucao"], d["semente_selecao"],
                 d["variante"], d["risco"], d["n_ativos"], d["n_dias"], d["risco_aberto_por_m"],
+                d.get("candidato_operacional"),
             )
             if obtido != esperado:
                 raise ValueError(f"cabecalho divergente na tarefa {tarefa}")
